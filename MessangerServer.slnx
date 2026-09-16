@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="ClassLibrary_Message/ClassLibrary_Message.csproj" />
+  <Project Path="MessangerServer/MessangerServer.csproj" />
+</Solution>
