@@ -1,6 +1,9 @@
+using ClassLibrary_Message;
+using Microsoft.EntityFrameworkCore;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.Serialization.Json;
@@ -8,22 +11,16 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using ClassLibrary_Message;
-using Microsoft.EntityFrameworkCore;
-using System.Linq;
-
 
 namespace MessangerServer
 {
     public partial class Form1 : Form
     {
-        TcpListener listener;
-        List<TcpClient> clients = new List<TcpClient>();
-        Dictionary<string, TcpClient> onlineUsers = new Dictionary<string, TcpClient>();
-
-       
-
+        private TcpListener listener;
+        private List<TcpClient> clients = new List<TcpClient>();
+        private Dictionary<string, TcpClient> onlineUsers = new Dictionary<string, TcpClient>();
         public SynchronizationContext uiContext;
+
         public Form1()
         {
             InitializeComponent();
@@ -31,232 +28,266 @@ namespace MessangerServer
             buttonStop.Enabled = false;
         }
 
-        private void Form1_Load(object sender, EventArgs e)
-        {
 
+        private async Task SendText(TcpClient client, string text)
+        {
+            NetworkStream stream = client.GetStream();
+            byte[] data = Encoding.UTF8.GetBytes(text + "\n");
+            await stream.WriteAsync(data, 0, data.Length);
+        }
+
+        private MessageTCP DeserializeMessage(string json)
+        {
+            MemoryStream stream = new MemoryStream(Encoding.UTF8.GetBytes(json));
+            DataContractJsonSerializer formatter = new DataContractJsonSerializer(typeof(MessageTCP));
+            MessageTCP message = (MessageTCP)formatter.ReadObject(stream);
+            stream.Close();
+            return message;
         }
 
         private async void Receive(TcpClient tcpClient)
         {
-            await Task.Run(async () =>
+            NetworkStream netstream = tcpClient.GetStream();
+            StreamReader reader = new StreamReader(netstream, Encoding.UTF8);
+            string userName = "";
+
+            try
             {
-                NetworkStream netstream = null;
-                string userName = null;
-
-                try
+                while (true)
                 {
-                    netstream = tcpClient.GetStream();
+                    string json = await reader.ReadLineAsync();
 
-                    byte[] arr = new byte[tcpClient.ReceiveBufferSize];
-
-                    while (true)
+                    if (json == null)
                     {
-                        int len = await netstream.ReadAsync(arr,0,tcpClient.ReceiveBufferSize);
+                        break;
+                    }
 
-                        if (len == 0)
-                        {
-                            if (userName != null && onlineUsers.ContainsKey(userName))
-                            {
-                                onlineUsers.Remove(userName);
-                            }
+                    MessageTCP m = DeserializeMessage(json);
 
-                            netstream.Close();
-                            tcpClient.Close();
+                    userName = m.User;
 
-                            return;
-                        }
-
-                        MemoryStream stream = new MemoryStream(arr, 0, len);
-
-                        var jsonFormatter = new DataContractJsonSerializer(typeof(MessageTCP));
-
-                        MessageTCP m = jsonFormatter.ReadObject(stream) as MessageTCP;
-
-                        stream.Close();
-
-                        userName = m.User;
-
-                        MessangerContext context = new MessangerContext();
-
-                        User user = context.Users.FirstOrDefault(u => u.UserName == m.User);
+                    using (MessangerContext context = new MessangerContext())
+                    {
+                        User user = context.Users.FirstOrDefault(x => x.UserName == m.User);
 
                         if (user == null)
                         {
-                            user = new User
-                            {
-                                UserName = m.User,
-                                Host = m.Host
-                            };
-
+                            user = new User();
+                            user.UserName = m.User;
+                            user.Host = m.Host;
                             context.Users.Add(user);
                         }
                         else
                         {
                             user.Host = m.Host;
                         }
-
                         context.SaveChanges();
-                        context.Dispose();
-
-                        if (!onlineUsers.ContainsKey(m.User))
-                        {
-                            onlineUsers.Add(m.User,tcpClient);
-                        }
-
-                        
-                        if (m.Message == "GET_HISTORY")
-                        {
-                            string messages = "";
-
-                            context = new MessangerContext();
-
-                            User sender = context.Users.FirstOrDefault(u => u.UserName == m.User);
-
-                            User receiver = context.Users.FirstOrDefault(u => u.UserName == m.Receiver);
-
-                            var history =
-                                context.Messages
-                                .Include(x => x.Sender)
-                                .Include(x => x.Receiver)
-                                .Where(x =>
-                                    (x.SenderId == sender.Id && x.ReceiverId == receiver.Id)||
-                                    (x.SenderId == receiver.Id && x.ReceiverId == sender.Id))
-                                .OrderBy(x => x.SendAt).ToList();
-
-                            foreach (Message message in history)
-                            {
-                                messages += message.Sender.UserName +" -> " + message.Receiver.UserName +
-                                    ": " + message.Text + Environment.NewLine;
-                            }
-
-                            context.Dispose();
-
-                            byte[] msg = Encoding.UTF8.GetBytes(messages);
-
-                            await netstream.WriteAsync(msg,0,msg.Length);
-                        }
-
-                      
-                        else if (!string.IsNullOrWhiteSpace(m.Message))
-                        {
-                            context = new MessangerContext();
-
-                            User sender = context.Users.FirstOrDefault(u => u.UserName == m.User);
-
-                            User receiver =context.Users.FirstOrDefault(u => u.UserName == m.Receiver);
-
-                            Message message = new Message
-                                {
-                                    SenderId = sender.Id,
-                                    ReceiverId = receiver.Id,
-                                    Text = m.Message,
-                                    SendAt = m.SendAt
-                                };
-
-                            context.Messages.Add(message);
-                            context.SaveChanges();
-                            context.Dispose();
-
-                          
-                            if (onlineUsers.ContainsKey(m.Receiver))
-                            {
-                                TcpClient receiverClient = onlineUsers[m.Receiver];
-
-                                NetworkStream receiverStream = receiverClient.GetStream();
-
-                                MemoryStream messageStream = new MemoryStream();
-
-                                var formatter = new DataContractJsonSerializer(typeof(MessageTCP));
-
-                                formatter.WriteObject(messageStream,m);
-
-                                byte[] messageBytes = messageStream.ToArray();
-
-                                messageStream.Close();
-
-                                await receiverStream.WriteAsync(messageBytes,0,messageBytes.Length);
-                            }
-                        }
-
-                        string result = m.Host + " - " + m.User + " - " + m.Message;
-
-                        uiContext.Send(
-                            d => listBox1.Items.Add(result),
-                            null);
                     }
-                }
-                catch (Exception ex)
-                {
-                    MessageBox.Show(
-                        "Сервер: " + ex.Message);
 
-                    netstream?.Close();
-                    tcpClient?.Close();
+
+                    bool newUser = !onlineUsers.ContainsKey(m.User);
+
+                    onlineUsers[m.User] = tcpClient;
+
+                    if (newUser)
+                    {
+                        await SendOnlineUsers();
+                    }
+
+
+                    if (m.Message == "GET_HISTORY")
+                    {
+                        await SendHistory(tcpClient, m.User, m.Receiver);
+                    }
+
+
+                    else if (m.Message != "")
+                    {
+                        await SaveAndSendMessage(m);
+                    }
+
+                    string result = m.Host + " - " + m.User + " - " + m.Message;
+
+                    uiContext.Post(
+                        d =>
+                        {
+                            listBox1.Items.Add(result);
+                        },
+                        null);
                 }
-            });
+            }
+            catch
+            {
+            }
+
+            if (userName != "")
+            {
+                onlineUsers.Remove(userName);
+            }
+
+            netstream.Close();
+            tcpClient.Close();
+            clients.Remove(tcpClient);
         }
 
 
+        private async Task SendOnlineUsers()
+        {
+            foreach (var item in onlineUsers)
+            {
+                string currentUser = item.Key;
+                TcpClient client = item.Value;
+                string usersMessage = "USERS|";
+
+                foreach (string user in onlineUsers.Keys)
+                {
+
+                    if (user != currentUser)
+                    {
+                        usersMessage += user + "|";
+                    }
+                }
+
+                await SendText(client, usersMessage);
+            }
+        }
+        private async Task SaveAndSendMessage(MessageTCP m)
+        {
+            using (MessangerContext context = new MessangerContext())
+            {
+                User sender = context.Users.FirstOrDefault(x => x.UserName == m.User);
+
+                User receiver = context.Users.FirstOrDefault(x => x.UserName == m.Receiver);
+
+                if (sender == null || receiver == null)
+                {
+                    return;
+                }
+
+                Message message = new Message();
+                message.SenderId = sender.Id;
+                message.ReceiverId = receiver.Id;
+                message.Text = m.Message;
+                message.SendAt = m.SendAt;
+
+                context.Messages.Add(message);
+                context.SaveChanges();
+            }
+
+
+            if (onlineUsers.ContainsKey(m.Receiver))
+            {
+                TcpClient receiverClient = onlineUsers[m.Receiver];
+                await SendMessageToClient(receiverClient, m);
+            }
+        }
+
+
+        private async Task SendMessageToClient(TcpClient client, MessageTCP message)
+        {
+            MemoryStream stream = new MemoryStream();
+            DataContractJsonSerializer formatter = new DataContractJsonSerializer(typeof(MessageTCP));
+            formatter.WriteObject(stream, message);
+            string json = Encoding.UTF8.GetString(stream.ToArray());
+            stream.Close();
+            await SendText(client, "MESSAGE|" + json);
+        }
+
+
+        private async Task SendHistory(TcpClient tcpClient, string senderName, string receiverName)
+        {
+            using (MessangerContext context = new MessangerContext())
+            {
+                User sender = context.Users.FirstOrDefault(x => x.UserName == senderName);
+                User receiver = context.Users.FirstOrDefault(x => x.UserName == receiverName);
+
+                List<Message> history = context.Messages
+                        .Include(x => x.Sender)
+                        .Include(x => x.Receiver)
+                        .Where(x =>
+                            (x.SenderId == sender.Id && x.ReceiverId == receiver.Id) ||
+                            (x.SenderId == receiver.Id && x.ReceiverId == sender.Id))
+                        .OrderBy(x => x.SendAt)
+                        .ToList();
+
+
+                StringBuilder messages = new StringBuilder();
+
+                foreach (Message message in history)
+                {
+                    string senderUserName = message.Sender.UserName;
+                    string receiverUserName = message.Receiver.UserName;
+                    string text = message.Text;
+                    text = text.Replace("\r\n", "\\n");
+                    text = text.Replace( "\n", "\\n");
+                    messages.Append(senderUserName + " -> " + receiverUserName + ": " + text);
+                    messages.Append("\\n");
+                }
+
+                await SendText(tcpClient, "HISTORY|" + messages.ToString());
+            }
+        }
 
 
         private async void Accept()
         {
-            await Task.Run(async () =>
+            try
             {
-                try
-                {
-                    listener = new TcpListener(IPAddress.Any, 49152);
-                    listener.Start();
+                listener = new TcpListener(IPAddress.Any, 49152);
+                listener.Start();
 
-                    uiContext.Post(d =>
-                    {
-                        buttonStart.Enabled = false;
-                        buttonStop.Enabled = true;
-                        label1.Text = "Статус: Сервер запущений";
-                    }, null);
-                    while (true)
-                    {
-                        TcpClient client = await listener.AcceptTcpClientAsync();
-                        clients.Add(client);
-                        Receive(client);
-                    }
-                }
-                catch (Exception ex)
+                buttonStart.Enabled = false;
+                buttonStop.Enabled = true;
+
+                label1.Text = "Статус: Сервер працює";
+
+                while (true)
                 {
-                    MessageBox.Show("Сервер: " + ex.Message);
+                    TcpClient client = await listener.AcceptTcpClientAsync();
+                    clients.Add(client);
+                    Receive(client);
                 }
-            });
+            }
+            catch
+            {
+            }
         }
 
-        private async void buttonStart_Click(object sender, EventArgs e)
+
+        private void buttonStart_Click(object sender, EventArgs e)
         {
             Accept();
         }
-                
 
         private void buttonStop_Click(object sender, EventArgs e)
         {
-            try
+            listener.Stop();
+
+            foreach (TcpClient client in clients)
             {
-                listener?.Stop();
-
-                foreach (TcpClient client in clients)
-                {
-                    client.Close();
-                }
-
-                clients.Clear();
-
-                buttonStart.Enabled = true;
-                buttonStop.Enabled = false;
-
-                label1.Text = "Статус: Сервер зупинений";
-                listBox1.Items.Clear();
+                client.Close();
             }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Сервер: " + ex.Message);
-            }
+
+            clients.Clear();
+            onlineUsers.Clear();
+            buttonStart.Enabled = true;
+            buttonStop.Enabled = false;
+            label1.Text = "Статус: Сервер зупинено";
+            listBox1.Items.Clear();
         }
+
+        private void Form1_FormClosed(object sender, FormClosedEventArgs e)
+        {
+            listener?.Stop();
+            foreach (TcpClient client in clients)
+            {
+                client.Close();
+            }
+            clients.Clear();
+            onlineUsers.Clear();
+        }
+
     }
+
+
 }

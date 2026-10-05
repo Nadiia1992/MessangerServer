@@ -101,7 +101,6 @@
             MinimizeBox = false;
             Name = "Form1";
             Text = "Messanger Server";
-            Load += Form1_Load;
             ResumeLayout(false);
             PerformLayout();
         }
